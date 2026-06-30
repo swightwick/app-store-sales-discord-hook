@@ -1,0 +1,9 @@
+{
+  "name": "app-store-connect-notify",
+  "version": "1.0.0",
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node src/index.js"
+  }
+}
