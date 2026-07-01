@@ -1,8 +1,14 @@
 import { createSign } from 'crypto';
 import { gunzip } from 'zlib';
 import { promisify } from 'util';
+import { readFile, writeFile, mkdir } from 'fs/promises';
+import { fileURLToPath } from 'url';
+import path from 'path';
 
 const gunzipAsync = promisify(gunzip);
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const STATE_PATH = path.join(__dirname, '..', 'state', 'sales-state.json');
 
 function base64url(buf) {
   return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
@@ -65,8 +71,10 @@ function parseReport(tsv) {
     .map(line => Object.fromEntries(headers.map((h, i) => [h, line.split('\t')[i] ?? ''])));
 }
 
+// Groups rows by app, then by price+currency, so repeated runs can be diffed
+// against the previous run's cumulative unit counts per group.
 function summarize(rows) {
-  const map = new Map();
+  const apps = new Map();
   for (const row of rows) {
     const id = row['Apple Identifier'];
     const units = parseInt(row['Units'] ?? '0', 10);
@@ -76,12 +84,61 @@ function summarize(rows) {
     const customerCurrency = row['Customer Currency'] ?? 'USD';
     const proceeds = parseFloat(row['Developer Proceeds'] ?? '0');
     const proceedsCurrency = row['Currency of Proceeds'] ?? 'USD';
-    if (!map.has(id)) map.set(id, { title, units: 0, rows: [] });
-    const entry = map.get(id);
-    entry.units += units;
-    entry.rows.push({ units, customerPrice, customerCurrency, proceeds, proceedsCurrency });
+
+    if (!apps.has(id)) apps.set(id, { title, groups: new Map() });
+    const groups = apps.get(id).groups;
+    const key = `${customerCurrency}_${customerPrice}`;
+    if (!groups.has(key)) {
+      groups.set(key, { customerPrice, customerCurrency, proceedsCurrency, units: 0, totalProceeds: 0 });
+    }
+    const g = groups.get(key);
+    g.units += units;
+    g.totalProceeds += proceeds * units;
   }
-  return [...map.values()];
+  return apps;
+}
+
+async function loadState() {
+  try {
+    return JSON.parse(await readFile(STATE_PATH, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+async function saveState(date, apps) {
+  const serialized = {};
+  for (const [id, app] of apps) {
+    const groups = {};
+    for (const [key, g] of app.groups) groups[key] = g.units;
+    serialized[id] = { title: app.title, groups };
+  }
+  await mkdir(path.dirname(STATE_PATH), { recursive: true });
+  await writeFile(STATE_PATH, JSON.stringify({ date, apps: serialized }, null, 2) + '\n');
+}
+
+// Returns only the units/proceeds not seen in a previous run for this date.
+function diffAgainstPrevious(apps, previousApps) {
+  const delta = [];
+  for (const [id, app] of apps) {
+    const prevGroups = previousApps[id]?.groups ?? {};
+    const groups = [];
+    for (const [key, g] of app.groups) {
+      const prevUnits = prevGroups[key] ?? 0;
+      const newUnits = g.units - prevUnits;
+      if (newUnits <= 0) continue;
+      const proceedsPerUnit = g.totalProceeds / g.units;
+      groups.push({
+        customerPrice: g.customerPrice,
+        customerCurrency: g.customerCurrency,
+        proceedsCurrency: g.proceedsCurrency,
+        units: newUnits,
+        totalProceeds: proceedsPerUnit * newUnits,
+      });
+    }
+    if (groups.length) delta.push({ title: app.title, groups });
+  }
+  return delta;
 }
 
 async function getGBPRates() {
@@ -106,21 +163,11 @@ function fmt(amount, currency) {
 
 async function postToDiscord(date, apps) {
   const gbpRates = await getGBPRates();
-  const totalUnits = apps.reduce((s, a) => s + a.units, 0);
+  const totalUnits = apps.reduce((s, a) => s + a.groups.reduce((gs, g) => gs + g.units, 0), 0);
 
   let totalGBP = 0;
   const fields = apps.map(app => {
-    // Group by price+currency so multiple countries with the same price collapse
-    const groups = new Map();
-    for (const row of app.rows) {
-      const key = `${row.customerCurrency}_${row.customerPrice}`;
-      if (!groups.has(key)) groups.set(key, { ...row, units: 0, totalProceeds: 0 });
-      const g = groups.get(key);
-      g.units += row.units;
-      g.totalProceeds += row.proceeds * row.units;
-    }
-
-    const lines = [...groups.values()].map(g => {
+    const lines = app.groups.map(g => {
       const gbp = toGBP(g.totalProceeds, g.proceedsCurrency, gbpRates);
       if (gbp != null) totalGBP += gbp;
       const priceStr = fmt(g.customerPrice, g.customerCurrency);
@@ -136,10 +183,10 @@ async function postToDiscord(date, apps) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       embeds: [{
-        title: `App Store Sales — ${date}`,
+        title: `New App Store Sales — ${date}`,
         color: 0x0071e3,
         fields,
-        footer: { text: `${totalUnits} total unit${totalUnits !== 1 ? 's' : ''} · ${fmt(totalGBP, 'GBP')} proceeds` },
+        footer: { text: `${totalUnits} new unit${totalUnits !== 1 ? 's' : ''} · ${fmt(totalGBP, 'GBP')} proceeds` },
       }],
     }),
   });
@@ -162,13 +209,26 @@ async function main() {
 
   const apps = summarize(parseReport(tsv));
 
-  if (apps.length === 0) {
+  if (apps.size === 0) {
     console.log(`No sales on ${date}`);
     return;
   }
 
-  await postToDiscord(date, apps);
-  console.log(`Posted: ${apps.length} app(s) with sales on ${date}`);
+  const previous = await loadState();
+  const previousApps = previous?.date === date ? previous.apps : {};
+  const delta = diffAgainstPrevious(apps, previousApps);
+
+  // Save the full cumulative state now so the next run's diff is correct,
+  // regardless of whether there was anything new to post this time.
+  await saveState(date, apps);
+
+  if (delta.length === 0) {
+    console.log(`No new sales since last check on ${date}`);
+    return;
+  }
+
+  await postToDiscord(date, delta);
+  console.log(`Posted: new sales in ${delta.length} app(s) on ${date}`);
 }
 
 main().catch(err => { console.error(err.message); process.exit(1); });
